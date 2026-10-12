@@ -2,7 +2,7 @@ name: reno
 
 services:
   server:
-    image: ${RENO_IMAGE:-ghcr.io/gohostieee/reno:latest}
+    image: ${RENO_IMAGE:-ghcr.io/gohostieee/project-buchanan:latest}
     build:
       context: .
       dockerfile: Dockerfile
