@@ -13,6 +13,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $env:AWS_PAGER = ''
+$env:AWS_CLI_OUTPUT_ENCODING = 'UTF-8'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 Set-Location -LiteralPath $repoRoot
 
