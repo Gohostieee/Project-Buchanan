@@ -119,6 +119,7 @@ trap - ERR INT TERM
 docker ps -a --filter 'name=^/reno-rollback-' --format '{{.Names}}' \
   | awk -v keep="$rollback_name" '$0 != keep' \
   | xargs -r docker rm -f >/dev/null
-docker image prune -f >/dev/null
+# Images referenced by the live or retained rollback container are kept.
+docker image prune -af >/dev/null
 
 echo "Deployment ${image_uri##*:} is healthy. Previous container retained as $rollback_name."
