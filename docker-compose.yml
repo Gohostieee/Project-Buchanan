@@ -1,0 +1,35 @@
+name: reno
+
+services:
+  server:
+    image: ${RENO_IMAGE:-ghcr.io/gohostieee/reno:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 2m
+    ports:
+      - "${RENO_PORT:-54321}:54321/tcp"
+    environment:
+      PORT: "54321"
+      BYOND_TRUSTED: "1"
+      BYOND_PARAMS: "${BYOND_PARAMS:-}"
+    volumes:
+      - type: bind
+        source: ./config
+        target: /opt/reno/config
+        read_only: true
+      - type: volume
+        source: reno-data
+        target: /opt/reno/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  reno-data:

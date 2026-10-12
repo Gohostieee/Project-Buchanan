@@ -1,27 +1,56 @@
-.dockerignore
-.editorconfig
-GPLv3.txt
-LICENSE
-README.md
-TGS3.json
+# Version control and editor state
+.git
 .github
 .gitignore
 .gitattributes
-.git/hooks
-.git/info
-.git/modules
-.git/objects
-.git/refs
+.gitmodules
+.vscode
+.vs
 .vs*
-cfg
-data
+.idea
+
+# Documentation and non-runtime project metadata
+README*
+LICENSE
+GPLv3.txt
+CODEOWNERS
+CONTRIBUTING*
+docs
 SQL
+
+# Server configuration and mutable state must be mounted at runtime.
+# Keep it out of image layers except for the public lobby artwork that is copied
+# into the deployed runtime fallback path during the build.
+config/*
+!config/maps.txt
+!config/title_screens/
+!config/title_screens/images/
+!config/title_screens/images/title1.png
+data
+cfg
+
+# Local dependencies, caches, test output, and compiled artifacts
 node_modules
-fortune13.dmb
-fortune13.int
-fortune13.rsc
-fortune13.lk
-fortune13.dyn.rsc
-*.dll
-Dockerfile
+**/node_modules
+coverage
+tmp
+temp
+build
+.env
+.env.*
+**/__pycache__
 tools/bootstrap/.cache
+*.log
+*.zip
+!docker/vendor/516.1688_byond_linux.zip
+*.dmb
+*.rsc
+*.lk
+*.int
+*.dyn.rsc
+*.dll
+*.so
+
+# Local container files do not need to be sent into COPY . .
+Dockerfile*
+docker-compose*.yml

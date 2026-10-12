@@ -1,0 +1,43 @@
+version: 0.2
+
+env:
+  variables:
+    IMAGE_REPO_NAME: reno
+    IMAGE_TAG: latest
+    DOCKER_BUILDKIT: "1"
+
+phases:
+  pre_build:
+    commands:
+      - set -eu
+      - AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+      - ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - REPOSITORY_URI="${ECR_REGISTRY}/${IMAGE_REPO_NAME}"
+      - COMMIT_TAG="$(printf '%s' "${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}" | cut -c1-12 | tr -c '[:alnum:]_.-' '-')"
+      - export AWS_ACCOUNT_ID ECR_REGISTRY REPOSITORY_URI COMMIT_TAG
+      - test -n "${BYOND_ARCHIVE_S3_URI:-}" || { echo "BYOND_ARCHIVE_S3_URI is required" >&2; exit 64; }
+      - mkdir -p docker/vendor
+      - aws s3 cp "${BYOND_ARCHIVE_S3_URI}" docker/vendor/516.1688_byond_linux.zip
+      - echo '16278f318cdeb4b77c57868dd7135032fde717ea6226269d22b2a1a50968e7f9  docker/vendor/516.1688_byond_linux.zip' | sha256sum -c -
+      - aws ecr describe-repositories --repository-names "${IMAGE_REPO_NAME}" >/dev/null 2>&1 || aws ecr create-repository --repository-name "${IMAGE_REPO_NAME}" --image-scanning-configuration scanOnPush=true --image-tag-mutability MUTABLE >/dev/null
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+      - echo "Building ${REPOSITORY_URI}:${COMMIT_TAG} for linux/amd64"
+
+  build:
+    commands:
+      - set -eu
+      - docker build --pull --platform linux/amd64 --tag "${REPOSITORY_URI}:${IMAGE_TAG}" --tag "${REPOSITORY_URI}:${COMMIT_TAG}" .
+
+  post_build:
+    commands:
+      - set -eu
+      - docker push "${REPOSITORY_URI}:${IMAGE_TAG}"
+      - docker push "${REPOSITORY_URI}:${COMMIT_TAG}"
+      - printf '[{"name":"reno","imageUri":"%s"}]' "${REPOSITORY_URI}:${COMMIT_TAG}" > imagedefinitions.json
+      - printf '{"repositoryUri":"%s","imageTag":"%s","imageUri":"%s"}\n' "${REPOSITORY_URI}" "${COMMIT_TAG}" "${REPOSITORY_URI}:${COMMIT_TAG}" > image-detail.json
+      - echo "Published ${REPOSITORY_URI}:${IMAGE_TAG} and ${REPOSITORY_URI}:${COMMIT_TAG}"
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - image-detail.json

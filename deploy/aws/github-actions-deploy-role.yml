@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  GitHub Actions deployment identity and private image repository for Reno -
+  builds off-host and grants rollout access to exactly one EC2 instance.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: GitHub OIDC -> ECR image push -> SSM guarded single-host handoff
+    must:
+      - Trust only the configured repository and production branch
+      - No stored AWS access keys in GitHub
+      - Scope image access to one ECR repository and SSM commands to one instance
+    ref:
+      - at: docs/AWS_DOCKER.md
+        has: CI rollout setup, operation, rollback, and troubleshooting
+        scope: shared
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: Case-sensitive GitHub repository owner.
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+  GitHubRepository:
+    Type: String
+    Description: Case-sensitive GitHub repository name.
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+  GitHubOwnerId:
+    Type: String
+    Description: Immutable numeric GitHub owner ID used in the OIDC subject claim.
+    AllowedPattern: '^[0-9]+$'
+  GitHubRepositoryId:
+    Type: String
+    Description: Immutable numeric GitHub repository ID used in the OIDC subject claim.
+    AllowedPattern: '^[0-9]+$'
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the deployment role.
+    AllowedPattern: '^[A-Za-z0-9_./-]+$'
+  InstanceId:
+    Type: String
+    Description: EC2 instance managed by the deployment workflow.
+    AllowedPattern: '^i-[0-9a-f]+$'
+  InstanceRoleName:
+    Type: String
+    Description: IAM role attached to the EC2 instance that pulls deployment images.
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]+$'
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: Reuse the account's GitHub OIDC provider; leave empty only if none exists.
+
+Conditions:
+  CreateGitHubOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, '']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Exchanges GitHub signed job identities for short-lived AWS sessions; avoids repository secrets.
+        must:
+          - Provider URL and STS audience must match GitHub Actions OIDC
+        mutable: must-never-change
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: application
+          Value: reno
+
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores commit-addressed images so EC2 only pulls during rollout; avoids build load on the live game host.
+        must:
+          - Keep tags immutable so a reviewed commit always identifies the same image
+          - Keep scan-on-push enabled
+        mutable: change-with-constraints
+    Properties:
+      EmptyOnDelete: false
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Keep 20 deployment images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: application
+          Value: reno
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets only main of one repository push an immutable image and run the guarded rollout on one host.
+        must:
+          - Keep sub claim scoped to one repository branch
+          - Keep image writes scoped to ImageRepository
+          - Keep SendCommand scoped to the managed instance and AWS shell document
+        mutable: change-with-constraints
+        mutability:
+          AssumeRolePolicyDocument: review-required
+          Policies: review-required
+    Properties:
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateGitHubOidcProvider, !Ref GitHubOidcProvider, !Ref ExistingGitHubOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepository}@${GitHubRepositoryId}:ref:refs/heads/${GitHubBranch}
+      Policies:
+        - PolicyName: deploy-reno
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AuthenticateToEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PushDeploymentImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:DescribeImages
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ImageRepository.Arn
+              - Sid: RunRolloutOnServer
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}
+              - Sid: ReadRolloutResult
+                Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: '*'
+      Tags:
+        - Key: application
+          Value: reno
+        - Key: purpose
+          Value: github-deployment
+
+  InstanceImagePullPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Allows the existing game host to authenticate to ECR and pull only this deployment repository.
+        must:
+          - Attach only to the configured game instance role
+          - Do not grant image push or repository mutation
+        mutable: change-with-constraints
+    Properties:
+      PolicyName: pull-reno-deployment-images
+      Roles:
+        - !Ref InstanceRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AuthenticateToEcr
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Sid: PullDeploymentImage
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource: !GetAtt ImageRepository.Arn
+
+Outputs:
+  DeployRoleArn:
+    Description: Role ARN to store as the AWS_DEPLOY_ROLE_ARN GitHub repository variable.
+    Value: !GetAtt GitHubDeployRole.Arn
+  ImageRepositoryUri:
+    Description: Private ECR URI to store as the AWS_ECR_REPOSITORY_URI GitHub variable.
+    Value: !GetAtt ImageRepository.RepositoryUri

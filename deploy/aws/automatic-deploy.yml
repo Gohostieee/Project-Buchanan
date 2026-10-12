@@ -1,0 +1,495 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Automatic Reno EC2 deployments - polls the public main branch, builds
+  immutable images in CodeBuild, and uses SSM for guarded single-host rollout.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: EventBridge schedule -> Lambda commit check -> CodeBuild -> ECR -> SSM guarded EC2 handoff
+    must:
+      - Build only an exact 40-character commit from the configured public repository branch
+      - Never store GitHub, BYOND, or long-lived AWS credentials
+      - Keep deployment serialized and update live SHA only after health + public TCP checks pass
+      - A real BYOND client reconnect remains external to AWS hub activation
+    ref:
+      - at: docs/AWS_DOCKER.md
+        has: AWS-native automatic deployment operation and BYOND hub limitation
+        scope: shared
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: Gohostieee
+    Description: Case-sensitive owner of the public GitHub repository.
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+  GitHubRepository:
+    Type: String
+    Default: Project-Buchanan
+    Description: Case-sensitive public GitHub repository name.
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch polled for automatic production deployments.
+    AllowedPattern: '^[A-Za-z0-9_./-]+$'
+  InstanceId:
+    Type: String
+    Description: Existing EC2 instance receiving guarded deployments.
+    AllowedPattern: '^i-[0-9a-f]+$'
+  PublicIp:
+    Type: String
+    Description: Stable public IPv4 address used for rollout and connectivity checks.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+  GamePort:
+    Type: Number
+    Default: 54321
+    MinValue: 1
+    MaxValue: 65535
+  EcrRepositoryName:
+    Type: String
+    Description: Existing immutable ECR repository that stores deployment images.
+    AllowedPattern: '^[a-z0-9]+(?:[._/-][a-z0-9]+)*$'
+  SourceBucketName:
+    Type: String
+    Description: Existing private bucket containing the pinned BYOND archive.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  ByondArchiveKey:
+    Type: String
+    Default: source/dependencies/516.1688_byond_linux.zip
+    Description: Object key for the pinned BYOND Linux archive.
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+  PollSchedule:
+    Type: String
+    Default: rate(5 minutes)
+    Description: How often AWS checks main for a new commit.
+    AllowedValues:
+      - rate(5 minutes)
+      - rate(10 minutes)
+      - rate(15 minutes)
+      - rate(30 minutes)
+
+Resources:
+  DeploymentDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Retains failed scheduled Lambda deliveries for investigation instead of silently dropping them.
+        must:
+          - Keep encryption enabled and retention long enough for operator response
+        mutable: change-with-constraints
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: application
+          Value: reno
+
+  DeploymentDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets only this schedule deliver failed target events to the DLQ.
+        must:
+          - Keep SourceArn scoped to DeploymentSchedule
+        mutable: change-with-constraints
+    Properties:
+      Queues:
+        - !Ref DeploymentDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeDeadLetters
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeploymentDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-source-check
+
+  LiveShaParameter:
+    Type: AWS::SSM::Parameter
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Records only the last commit that completed rollout + health + public reachability checks; failed builds remain retryable.
+        must:
+          - Update only after successful deployment verification
+        mutable: change-with-constraints
+    Properties:
+      Name: !Sub /${AWS::StackName}/live-sha
+      Type: String
+      Value: NONE
+      Description: Last successfully deployed Git commit.
+      Tags:
+        application: reno
+
+  SourceCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-source-check
+      RetentionInDays: 30
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${AWS::StackName}
+      RetentionInDays: 30
+
+  SourceCheckRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Gives the poller only commit-state reads, serialized build start, logging, tracing, and failure delivery.
+        must:
+          - Do not grant image, instance, S3, or deployment mutation permissions
+        mutable: change-with-constraints
+        mutability:
+          AssumeRolePolicyDocument: review-required
+          Policies: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: check-and-start-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadDeploymentState
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/live-sha
+              - Sid: StartSerializedBuild
+                Effect: Allow
+                Action:
+                  - codebuild:ListBuildsForProject
+                  - codebuild:StartBuild
+                Resource: !GetAtt DeploymentBuildProject.Arn
+              - Sid: ReadBuildState
+                Effect: Allow
+                Action: codebuild:BatchGetBuilds
+                Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:build/${DeploymentBuildProject}:*
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${SourceCheckLogGroup.Arn}:*
+              - Sid: WriteTraces
+                Effect: Allow
+                Action:
+                  - xray:PutTelemetryRecords
+                  - xray:PutTraceSegments
+                Resource: '*'
+              - Sid: WriteFailedInvocation
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeploymentDeadLetterQueue.Arn
+      Tags:
+        - Key: application
+          Value: reno
+
+  DeploymentBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Builds one exact commit, pushes only to the existing Reno ECR repository, and deploys only to one EC2 instance.
+        must:
+          - Keep S3 reads scoped to the pinned BYOND archive
+          - Keep ECR writes scoped to one repository
+          - Keep SSM SendCommand scoped to one instance + AWS shell document
+        mutable: change-with-constraints
+        mutability:
+          Policies: review-required
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${BuildLogGroup.Arn}:*
+              - Sid: ReadPinnedByondArchive
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${SourceBucketName}/${ByondArchiveKey}
+              - Sid: AuthenticateToEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: PushDeploymentImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:DescribeImages
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+              - Sid: RunRolloutOnServer
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}
+              - Sid: ReadRolloutResult
+                Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: '*'
+              - Sid: RecordLiveCommit
+                Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/live-sha
+      Tags:
+        - Key: application
+          Value: reno
+
+  DeploymentBuildProject:
+    Type: AWS::CodeBuild::Project
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Compiles Docker images off the live game host and runs the repository's rollback-safe SSM handoff.
+        must:
+          - Use x86_64 because BYOND + native libraries do not support this build on Arm
+          - Keep privileged mode for Docker builds
+          - Allow only one concurrent build
+        mutable: change-with-constraints
+        mutability:
+          Environment: review-required
+          ServiceRole: review-required
+    Properties:
+      ServiceRole: !GetAtt DeploymentBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              on-failure: ABORT
+              commands:
+                - git --version
+                - docker version
+            pre_build:
+              on-failure: ABORT
+              commands:
+                - test "$(printf '%s' "$GIT_SHA" | grep -Ec '^[0-9a-f]{40}$')" = 1
+                - mkdir source
+                - cd source
+                - git init
+                - git remote add origin "https://github.com/${GitHubOwner}/${GitHubRepository}.git"
+                - git fetch --depth 1 origin "$GIT_SHA"
+                - git checkout --detach FETCH_HEAD
+            build:
+              on-failure: ABORT
+              commands:
+                - cd "$CODEBUILD_SRC_DIR/source"
+                - bash deploy/aws/aws-native-build-deploy.sh
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: DOCKER_BUILDKIT
+            Type: PLAINTEXT
+            Value: '1'
+          - Name: ECR_REPOSITORY_URI
+            Type: PLAINTEXT
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${EcrRepositoryName}
+          - Name: INSTANCE_ID
+            Type: PLAINTEXT
+            Value: !Ref InstanceId
+          - Name: PUBLIC_IP
+            Type: PLAINTEXT
+            Value: !Ref PublicIp
+          - Name: GAME_PORT
+            Type: PLAINTEXT
+            Value: !Ref GamePort
+          - Name: SOURCE_BUCKET_NAME
+            Type: PLAINTEXT
+            Value: !Ref SourceBucketName
+          - Name: BYOND_ARCHIVE_KEY
+            Type: PLAINTEXT
+            Value: !Ref ByondArchiveKey
+          - Name: LIVE_SHA_PARAMETER
+            Type: PLAINTEXT
+            Value: !Ref LiveShaParameter
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+      ConcurrentBuildLimit: 1
+      QueuedTimeoutInMinutes: 30
+      TimeoutInMinutes: 120
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+          StreamName: deployment
+      Tags:
+        - Key: application
+          Value: reno
+
+  SourceCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SourceCheckLogGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Polls the public GitHub API without a token, skips unchanged commits and active builds, then starts one exact-SHA build.
+        must:
+          - Keep deployments serialized by the CodeBuild project concurrency limit
+          - Do not add GitHub or BYOND credentials
+          - Treat failed builds as retryable by leaving live SHA unchanged
+        mutable: change-with-constraints
+        mutability:
+          Role: review-required
+          Code: review-required
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-source-check
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SourceCheckRole.Arn
+      MemorySize: 128
+      Timeout: 20
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          GITHUB_OWNER: !Ref GitHubOwner
+          GITHUB_REPOSITORY: !Ref GitHubRepository
+          GITHUB_BRANCH: !Ref GitHubBranch
+          BUILD_PROJECT: !Ref DeploymentBuildProject
+          LIVE_SHA_PARAMETER: !Ref LiveShaParameter
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          import boto3
+
+          codebuild = boto3.client("codebuild")
+          ssm = boto3.client("ssm")
+
+          def handler(event, context):
+              owner = os.environ["GITHUB_OWNER"]
+              repository = os.environ["GITHUB_REPOSITORY"]
+              branch = os.environ["GITHUB_BRANCH"]
+              project = os.environ["BUILD_PROJECT"]
+              parameter = os.environ["LIVE_SHA_PARAMETER"]
+
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{owner}/{repository}/commits/{urllib.parse.quote(branch, safe='')}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "reno-aws-auto-deploy",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=8) as response:
+                  latest_sha = json.load(response)["sha"]
+              if not re.fullmatch(r"[0-9a-f]{40}", latest_sha):
+                  raise ValueError("GitHub returned an invalid commit SHA")
+
+              live_sha = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
+              if latest_sha == live_sha:
+                  return {"action": "unchanged", "sha": latest_sha}
+
+              build_ids = codebuild.list_builds_for_project(
+                  projectName=project,
+                  sortOrder="DESCENDING",
+              ).get("ids", [])[:10]
+              if build_ids:
+                  builds = codebuild.batch_get_builds(ids=build_ids).get("builds", [])
+                  if any(build["buildStatus"] == "IN_PROGRESS" for build in builds):
+                      return {"action": "build-already-running", "sha": latest_sha}
+
+              build = codebuild.start_build(
+                  projectName=project,
+                  environmentVariablesOverride=[
+                      {"name": "GIT_SHA", "value": latest_sha, "type": "PLAINTEXT"}
+                  ],
+              )["build"]
+              return {"action": "build-started", "sha": latest_sha, "buildId": build["id"]}
+
+  SourceCheckInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref SourceCheckFunction
+      Qualifier: $LATEST
+      MaximumEventAgeInSeconds: 300
+      MaximumRetryAttempts: 1
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeploymentDeadLetterQueue.Arn
+
+  DeploymentSchedule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Checks main cheaply on a fixed interval; polling avoids paid GitHub Actions and interactive CodeConnections OAuth.
+        must:
+          - Keep one Lambda target and DLQ
+        mutable: free-to-tune
+    Properties:
+      Name: !Sub ${AWS::StackName}-source-check
+      Description: Check the Reno main branch for a deployable commit.
+      ScheduleExpression: !Ref PollSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SourceCheckFunction.Arn
+          Id: SourceCheck
+          DeadLetterConfig:
+            Arn: !GetAtt DeploymentDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 300
+            MaximumRetryAttempts: 2
+
+  AllowScheduleInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SourceCheckFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeploymentSchedule.Arn
+
+Outputs:
+  SourceCheckFunctionName:
+    Description: Lambda function that checks main and starts deployments.
+    Value: !Ref SourceCheckFunction
+  BuildProjectName:
+    Description: CodeBuild project that builds and rolls out immutable images.
+    Value: !Ref DeploymentBuildProject
+  LiveShaParameterName:
+    Description: Parameter containing the last successfully deployed commit.
+    Value: !Ref LiveShaParameter
+  DeadLetterQueueUrl:
+    Description: Queue retaining failed scheduled deployment events.
+    Value: !Ref DeploymentDeadLetterQueue

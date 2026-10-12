@@ -241,3 +241,7 @@ define_sanity_output.txt
 # ezdb
 /db/
 /config/ezdb.txt
+
+# AWS/container deployment inputs and local receipts
+/docker/vendor/*.zip
+/build/

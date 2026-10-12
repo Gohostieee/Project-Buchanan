@@ -1,84 +1,144 @@
-# base = ubuntu + full apt update
-FROM ubuntu:xenial AS base
+# syntax=docker/dockerfile:1.7
+
+ARG UBUNTU_VERSION=22.04
+
+FROM ubuntu:${UBUNTU_VERSION} AS runtime-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
 RUN dpkg --add-architecture i386 \
     && apt-get update \
-    && apt-get upgrade -y \
-    && apt-get dist-upgrade -y \
     && apt-get install -y --no-install-recommends \
-        ca-certificates
+        ca-certificates \
+        libcurl4:i386 \
+        libgcc-s1:i386 \
+        libstdc++6:i386 \
+        netcat-openbsd \
+        zlib1g:i386 \
+    && rm -rf /var/lib/apt/lists/*
 
-# byond = base + byond installed globally
-FROM base AS byond
-WORKDIR /byond
+FROM runtime-base AS byond
 
-RUN apt-get install -y --no-install-recommends \
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
         curl \
-        unzip \
         make \
-        libstdc++6:i386
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY dependencies.sh .
+WORKDIR /opt/byond
 
-RUN . ./dependencies.sh \
-    && curl "http://www.byond.com/download/build/${BYOND_MAJOR}/${BYOND_MAJOR}.${BYOND_MINOR}_byond_linux.zip" -o byond.zip \
-    && unzip byond.zip \
-    && cd byond \
-    && sed -i 's|install:|&\n\tmkdir -p $(MAN_DIR)/man6|' Makefile \
-    && make install \
-    && chmod 644 /usr/local/byond/man/man6/* \
-    && apt-get purge -y --auto-remove curl unzip make \
-    && cd .. \
-    && rm -rf byond byond.zip
+COPY dependencies.sh /tmp/dependencies.sh
+COPY docker/vendor/516.1688_byond_linux.zip /opt/byond/byond.zip
 
-# build = byond + tgstation compiled and deployed to /deploy
+RUN set -eux; \
+    echo '16278f318cdeb4b77c57868dd7135032fde717ea6226269d22b2a1a50968e7f9  byond.zip' | sha256sum -c -; \
+    sed -i 's/\r$//' /tmp/dependencies.sh; \
+    . /tmp/dependencies.sh; \
+    unzip -q byond.zip; \
+    rm byond.zip; \
+    cd byond; \
+    make here; \
+    rm /tmp/dependencies.sh
+
+ENV BYOND_HOME=/opt/byond/byond
+ENV PATH="${BYOND_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${BYOND_HOME}/bin"
+
 FROM byond AS build
-WORKDIR /tgstation
 
-RUN apt-get install -y --no-install-recommends \
-        curl
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
 
 COPY . .
 
-RUN env TG_BOOTSTRAP_NODE_LINUX=1 tools/build/build \
+RUN find . -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \
+    && sed -i 's/\r$//' \
+        tools/build/build \
+        tools/bootstrap/node \
+        tools/bootstrap/python \
+        tools/deploy.sh \
+    && chmod 0755 \
+        tools/build/build \
+        tools/bootstrap/node \
+        tools/bootstrap/python \
+        tools/deploy.sh
+
+RUN --mount=type=cache,target=/var/cache/reno-bootstrap \
+    TG_BOOTSTRAP_NODE_LINUX=1 \
+    TG_BOOTSTRAP_CACHE=/var/cache/reno-bootstrap \
+    tools/build/build \
     && tools/deploy.sh /deploy
 
-# rust = base + rustc and i686 target
-FROM base AS rust
-RUN apt-get install -y --no-install-recommends \
-        curl && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-    && ~/.cargo/bin/rustup target add i686-unknown-linux-gnu
+FROM runtime-base AS native-libs
 
-# rust_g = base + rust_g compiled to /rust_g
-FROM rust AS rust_g
-WORKDIR /rust_g
+ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get install -y --no-install-recommends \
-        pkg-config:i386 \
-        libssl-dev:i386 \
-        gcc-multilib \
-        git \
-    && git init \
-    && git remote add origin https://github.com/tgstation/rust-g
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY dependencies.sh .
+COPY dependencies.sh /tmp/dependencies.sh
 
-RUN . ./dependencies.sh \
-    && git fetch --depth 1 origin "${RUST_G_VERSION}" \
-    && git checkout FETCH_HEAD \
-    && env PKG_CONFIG_ALLOW_CROSS=1 ~/.cargo/bin/cargo build --release --target i686-unknown-linux-gnu
+RUN set -eux; \
+    sed -i 's/\r$//' /tmp/dependencies.sh; \
+    . /tmp/dependencies.sh; \
+    mkdir -p /native; \
+    curl --fail --location --retry 5 --retry-delay 2 \
+        "https://github.com/tgstation/rust-g/releases/download/${RUST_G_VERSION}/librust_g.so" \
+        --output /native/librust_g.so; \
+    chmod 0755 /native/librust_g.so; \
+    rm /tmp/dependencies.sh
 
-# final = byond + runtime deps + rust_g + build
-FROM byond
-WORKDIR /tgstation
+FROM runtime-base AS final
 
-RUN apt-get install -y --no-install-recommends \
-        libssl1.0.0:i386 \
-        zlib1g:i386
+ENV BYOND_HOME=/opt/byond/byond
+ENV PATH="${BYOND_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${BYOND_HOME}/bin"
+ENV PORT=54321
+ENV DMB=fortune13.dmb
+ENV BYOND_TRUSTED=1
 
-COPY --from=build /deploy ./
-COPY --from=rust_g /rust_g/target/i686-unknown-linux-gnu/release/librust_g.so ./librust_g.so
+WORKDIR /opt/reno
 
-VOLUME [ "/tgstation/config", "/tgstation/data" ]
-ENTRYPOINT [ "DreamDaemon", "fortune13.dmb", "-port", "1337", "-trusted", "-close", "-verbose" ]
-EXPOSE 1337
+RUN groupadd --gid 10001 byond \
+    && useradd \
+        --uid 10001 \
+        --gid 10001 \
+        --home-dir /opt/reno \
+        --shell /usr/sbin/nologin \
+        byond \
+    && mkdir -p /opt/reno/config /opt/reno/data \
+    && chown -R 10001:10001 /opt/reno
+
+COPY --from=byond /opt/byond/byond /opt/byond/byond
+COPY --from=build --chown=10001:10001 /deploy/ /opt/reno/
+COPY --from=native-libs --chown=10001:10001 /native/librust_g.so /opt/reno/librust_g.so
+COPY --chown=10001:10001 config/maps.txt /opt/reno/config-defaults/maps.txt
+COPY docker/entrypoint.sh /usr/local/bin/reno-entrypoint
+COPY docker/healthcheck.sh /usr/local/bin/reno-healthcheck
+
+RUN sed -i 's/\r$//' /usr/local/bin/reno-entrypoint \
+    && sed -i 's/\r$//' /usr/local/bin/reno-healthcheck \
+    && chmod 0755 /usr/local/bin/reno-entrypoint /usr/local/bin/reno-healthcheck \
+    && if ldd /opt/reno/librust_g.so | grep -q "not found"; then exit 1; fi
+
+VOLUME ["/opt/reno/config", "/opt/reno/data"]
+
+EXPOSE 54321/tcp
+
+STOPSIGNAL SIGTERM
+
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+    CMD /usr/local/bin/reno-healthcheck
+
+ENTRYPOINT ["/usr/local/bin/reno-entrypoint"]

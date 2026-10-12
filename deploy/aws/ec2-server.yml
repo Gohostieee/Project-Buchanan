@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Reno BYOND server on one always-on EC2 host - uses Docker, a stable
+  Elastic IP, retained encrypted EBS data, and Session Manager instead of SSH.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: private S3 source -> x86_64 EC2 Docker build -> public EIP:54321; retained EBS data
+    must:
+      - Instance and image stay x86_64 because BYOND and native libs require it
+      - TCP game port must be directly reachable for BYOND hub probe and clients
+      - No SSH ingress or source-control credentials; administer through SSM
+      - Keep source bucket and data volume retained on stack deletion or replacement
+    ref:
+      - at: docs/AWS_DOCKER.md
+        has: build, deployment, networking, persistence, update, and rollback operations
+        scope: shared
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI from public SSM parameters.
+  InstanceType:
+    Type: String
+    Default: c6a.large
+    Description: x86_64 instance size for the game server and container builds.
+    AllowedValues:
+      - c6a.large
+      - c7a.large
+      - t3a.medium
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the server instance.
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone containing SubnetId and the retained data volume.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing SubnetId.
+  AllowedClientCidr:
+    Type: String
+    Description: IPv4 CIDR allowed to connect to the BYOND game port.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$'
+  GamePort:
+    Type: Number
+    Default: 54321
+    Description: Public DreamDaemon TCP port.
+    MinValue: 1
+    MaxValue: 65535
+  SourceArchiveKey:
+    Type: String
+    Default: source/reno-source.tar.gz
+    Description: S3 object key containing a clean archive of this repository.
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+  ByondArchiveKey:
+    Type: String
+    Default: source/dependencies/516.1688_byond_linux.zip
+    Description: S3 object key containing the official BYOND 516.1688 Linux archive.
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+  ByondArchiveSha256:
+    Type: String
+    Default: 16278f318cdeb4b77c57868dd7135032fde717ea6226269d22b2a1a50968e7f9
+    Description: SHA-256 digest of the pinned official BYOND Linux archive.
+    AllowedPattern: '^[A-Fa-f0-9]{64}$'
+  ServerName:
+    Type: String
+    Default: 'Fallout: Interstate 80'
+    Description: Public server name shown in the BYOND hub.
+    AllowedPattern: '^[A-Za-z0-9 :+.,!?()/-]+$'
+    MaxLength: 100
+  ServerTagline:
+    Type: String
+    Default: '[18+] Take a trip to Utah and see the Bonneville Salt Flats!'
+    Description: Public tagline shown in the BYOND hub.
+    AllowedPattern: '^[A-Za-z0-9 :+.,!?()\[\]/-]+$'
+    MaxLength: 200
+
+Conditions:
+  IsBurstableInstance: !Equals [!Ref InstanceType, t3a.medium]
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: application
+          Value: reno
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub ${SourceBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-reno-source
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${SourceBucket.Arn}/source/*
+      Tags:
+        - Key: application
+          Value: reno
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public BYOND game traffic for the Reno server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: BYOND hub probe and game clients
+          IpProtocol: tcp
+          FromPort: !Ref GamePort
+          ToPort: !Ref GamePort
+          CidrIp: !Ref AllowedClientCidr
+      Tags:
+        - Key: application
+          Value: reno
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      Size: 100
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-data
+        - Key: application
+          Value: reno
+
+  ServerInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Builds and runs the BYOND Docker image on a persistent single host without exposing SSH.
+        must:
+          - Keep host networking and matching internal and external ports for BYOND hub reachability
+          - Map the EC2 hostname to the Elastic IP so DreamDaemon advertises a public address
+          - Read source and dependencies only from the private stack bucket
+        mutable: change-with-constraints
+        mutability:
+          InstanceType: free-to-tune
+          UserData: review-required
+    DependsOn:
+      - SourceBucketPolicy
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 20
+            VolumeType: gp3
+      CreditSpecification: !If
+        - IsBurstableInstance
+        - CPUCredits: standard
+        - !Ref AWS::NoValue
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+        InstanceMetadataTags: enabled
+      Monitoring: true
+      SecurityGroupIds:
+        - !Ref ServerSecurityGroup
+      SubnetId: !Ref SubnetId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-server
+        - Key: application
+          Value: reno
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          install -d -m 0750 /var/lib/reno
+          echo STARTING > /var/lib/reno/bootstrap.status
+          trap 'echo FAILED > /var/lib/reno/bootstrap.status' ERR
+          exec > >(tee -a /var/log/reno-bootstrap.log) 2>&1
+
+          dnf install -y docker xfsprogs
+
+          data_volume_id='${DataVolume}'
+          data_device=''
+          for attempt in $(seq 1 120); do
+            for candidate in /dev/nvme*n1 /dev/xvdf; do
+              [ -b "$candidate" ] || continue
+              if command -v ebsnvme-id >/dev/null 2>&1; then
+                if ebsnvme-id -v "$candidate" 2>/dev/null | grep -q "$data_volume_id"; then
+                  data_device="$candidate"
+                  break 2
+                fi
+              elif [ "$candidate" = /dev/xvdf ]; then
+                data_device="$candidate"
+                break 2
+              fi
+            done
+            sleep 5
+          done
+          [ -n "$data_device" ]
+
+          if ! blkid "$data_device" >/dev/null 2>&1; then
+            mkfs.xfs -f "$data_device"
+          fi
+          install -d -m 0750 /srv/reno
+          data_uuid=$(blkid -s UUID -o value "$data_device")
+          grep -q "UUID=$data_uuid" /etc/fstab || echo "UUID=$data_uuid /srv/reno xfs defaults,nofail 0 2" >> /etc/fstab
+          mount /srv/reno
+
+          install -d -m 0710 /etc/docker
+          printf '%s\n' '{"data-root":"/srv/reno/docker","log-driver":"json-file","log-opts":{"max-size":"50m","max-file":"5"}}' > /etc/docker/daemon.json
+          systemctl enable --now docker
+
+          host_name=$(hostname)
+          if ! grep -qF "${ServerAddress} $host_name" /etc/hosts; then
+            printf '%s %s\n' '${ServerAddress}' "$host_name" >> /etc/hosts
+          fi
+
+          install -d -m 0750 /srv/reno/source /srv/reno/config /srv/reno/data
+          archive=/srv/reno/source.tar.gz
+          for attempt in $(seq 1 120); do
+            if aws s3 cp 's3://${SourceBucket}/${SourceArchiveKey}' "$archive"; then
+              break
+            fi
+            sleep 15
+          done
+          [ -s "$archive" ]
+          tar -xzf "$archive" -C /srv/reno/source
+
+          cd /srv/reno/source
+          mkdir -p docker/vendor
+          aws s3 cp \
+            's3://${SourceBucket}/${ByondArchiveKey}' \
+            docker/vendor/516.1688_byond_linux.zip
+          echo '${ByondArchiveSha256}  docker/vendor/516.1688_byond_linux.zip' | sha256sum -c -
+          docker build \
+            --pull \
+            --platform linux/amd64 \
+            --tag reno:latest \
+            .
+
+          printf '%s\n' \
+            '@SERVERNAME ${ServerName}' \
+            'SERVERTAGLINE ${ServerTagline}' \
+            'HUB' \
+            > /srv/reno/config/config.txt
+          chown -R 10001:10001 /srv/reno/config /srv/reno/data
+          cp config/maps.txt /srv/reno/config/maps.txt
+          chown 10001:10001 /srv/reno/config/maps.txt
+          chmod 0640 /srv/reno/config/maps.txt
+          chmod 0750 /srv/reno/config /srv/reno/data
+          chmod 0640 /srv/reno/config/config.txt
+
+          docker rm -f reno >/dev/null 2>&1 || true
+          docker run -d \
+            --name reno \
+            --restart unless-stopped \
+            --platform linux/amd64 \
+            --network host \
+            --hostname "$host_name" \
+            --add-host "$host_name:${ServerAddress}" \
+            --init \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            -e PORT=${GamePort} \
+            -e BYOND_TRUSTED=1 \
+            -v /srv/reno/config:/opt/reno/config:ro \
+            -v /srv/reno/data:/opt/reno/data \
+            reno:latest
+
+          rm -rf /srv/reno/source "$archive"
+          for attempt in $(seq 1 90); do
+            state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' reno)
+            [ "$state" = 'running healthy' ] && break
+            case "$state" in
+              exited*|dead*) docker logs --tail 100 reno; exit 1 ;;
+            esac
+            sleep 10
+          done
+          [ "$state" = 'running healthy' ]
+          echo RUNNING > /var/lib/reno/bootstrap.status
+
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref ServerInstance
+      VolumeId: !Ref DataVolume
+
+  ServerAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: application
+          Value: reno
+
+  ServerAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ServerAddress.AllocationId
+      InstanceId: !Ref ServerInstance
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance running the Reno Docker container.
+    Value: !Ref ServerInstance
+  PublicIp:
+    Description: Stable public IPv4 address registered through the BYOND hub.
+    Value: !Ref ServerAddress
+  ByondAddress:
+    Description: Direct BYOND connection address.
+    Value: !Sub byond://${ServerAddress}:${GamePort}
+  SourceBucketName:
+    Description: Private retained bucket receiving the clean source archive.
+    Value: !Ref SourceBucket
+  DataVolumeId:
+    Description: Retained encrypted EBS volume for Docker and mutable server data.
+    Value: !Ref DataVolume
+  InstanceRoleName:
+    Description: Instance role to grant read-only access to the deployment image repository.
+    Value: !Ref InstanceRole
